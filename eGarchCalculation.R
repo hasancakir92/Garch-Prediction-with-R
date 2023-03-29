@@ -1,0 +1,154 @@
+library(xts)
+library(zoo)
+library(quantmod)
+library(tseries)
+library(forecast)
+library(rugarch)
+library(RODBC)
+
+CalculateGarch<-function(con,symbol,yahoo_symbol,startDate,endDate){
+  ffrom<-as.Date(startDate) - as.difftime(727,unit="days")
+  #print(ffrom)
+  getSymbols(yahoo_symbol,src="yahoo",from=ffrom,to=endDate)
+  data<-get(yahoo_symbol)
+  
+  stock_prices<-na.omit(data, na.action = "omit", fill = NULL)
+  
+  returns = diff(log(Cl(stock_prices)))
+  returns[as.character(head(index(Cl(stock_prices)),1))] = 0
+  
+  symbol_data<-merge(stock_prices,returns, join='inner')
+  symbol_data$sGARCH_1_1= 0
+  symbol_data$eGARCH_1_0= 0
+  symbol_data$fGARCH_0_1= 0
+  symbol_data$iGARCH_1_1= 0
+  windowLength = 500
+  foreLength = length(symbol_data) - windowLength
+  
+  for (d in 0:foreLength) {
+    
+    #Subset of daily return data
+    tryCatch({
+      
+      if(windowLength+d>length(returns))
+        break
+      dailyReturnsSubSet = returns[(1+d):(windowLength+d)]
+      
+      
+      #Applying to auto arima to find arma orders for GARCH model.
+      #fit <- auto.arima(dailyReturnsSubSet)
+      #order<-arimaorder(fit)
+      final.aic <- Inf
+      final.order <- c(0,0,0)
+      for (p in 0:5) for (q in 0:5) {
+        if ( p == 0 && q == 0) {
+          next
+        }
+        
+        arimaFit = tryCatch( arima(dailyReturnsSubSet, order=c(p, 0, q)),
+                             error=function( err ) FALSE,
+                             warning=function( err ) FALSE )
+        
+        if( !is.logical( arimaFit ) ) {
+          current.aic <- AIC(arimaFit)
+          if (current.aic < final.aic) {
+            final.aic <- current.aic
+            final.order <- c(p, 0, q)
+            final.arima <- arima(dailyReturnsSubSet, order=final.order)
+          }
+        } else {
+          next
+        }
+      }
+      #print(final.order)
+      eGarchResult<-0
+      
+      
+      #BAD NEWS
+      #eGarch(1,1)
+      egarch11_spec <- ugarchspec(variance.model = list(model="eGARCH",garchOrder = c(1, 1)),mean.model = list(armaOrder = c(final.order[1], final.order[3]),include.mean=T),distribution.model="sged")
+      egarch11_fit<- tryCatch(ugarchfit(spec=egarch11_spec, data=dailyReturnsSubSet,solver = 'hybrid'), error=function(e) e, warning=function(w) w)
+      
+      if(!is(egarch11_fit, "warning")) 
+      {
+        forecasted = ugarchforecast(egarch11_fit, n.ahead=1)
+        result = forecasted@forecast$seriesFor
+        symbol_data[colnames(result),9]=result[1]
+        eGarchResult=result[1]
+      }
+      
+      
+      
+      current_date<-as.Date(colnames(result))
+      
+      
+      dailyDataId<-paste(format(current_date, "%Y%m%d"),symbol,sep="")  
+      day<-current_date
+      
+      
+      isExistQuery<-sprintf("Select Id From dbo.DailyData Where Id='%s'",dailyDataId)
+      isExist<-sqlQuery(con,isExistQuery)
+      
+      if(nrow(isExist)==0)
+      {
+        print(paste(day,"Not Exist!"))
+        
+      }
+      else{
+        open<-symbol_data[current_date,1]
+        high<-symbol_data[current_date,2]
+        low<-symbol_data[current_date,3]
+        close<-symbol_data[current_date,4]
+        volume<-symbol_data[current_date,5]
+        adjClose<-symbol_data[current_date,6]
+        dailyReturn<-symbol_data[current_date,7]
+        update_daily_data<-sprintf("UPDATE dbo.DailyData SET eGarch_1_1=%.9f WHERE Id='%s'",eGarchResult,dailyDataId)
+        
+        
+        sqlQuery(con,update_daily_data)
+        
+        update_symbol<-sprintf("UPDATE dbo.Symbol SET eGarchLatestUpdate='%s' Where SymbolCode='%s'",day,symbol)
+        sqlQuery(con,update_symbol)
+        
+        print(paste(day,"Updated!"))
+        
+        
+      }
+    },error=function(cond) {
+      print(cond)
+      # Choose a return value in case of error
+    })
+    
+    
+    
+    
+  }
+}
+
+con <- odbcDriverConnect('driver={SQL Server};server=localhost\\SQLEXPRESS;database=Investing;trusted_connection=true')
+res <- sqlQuery(con, 'SELECT * FROM dbo.Symbol')
+
+for(row in 1:nrow(res)){
+  code <- res[row, "SymbolCode"]
+  yahoo_symbol <- res[row, "YahooCode"]
+  description <- res[row, "Description"]
+  e_garch_latest_update <- res[row, "eGarchLatestUpdate"]
+  
+  if(!is.na(e_garch_latest_update) && e_garch_latest_update==Sys.Date()-as.difftime(1,unit="days")){
+    next
+  }
+  
+  startDate="2018-12-31"
+  if(!is.na(e_garch_latest_update)){
+    startDate=e_garch_latest_update
+  }
+  
+  if(code!="T")
+  {
+  print(paste("******************",description,"Start!**************************"))
+  CalculateGarch(con,code,yahoo_symbol,startDate,Sys.Date())
+  print(paste("******************",description,"End!  **************************"))
+  }
+  
+}
+odbcCloseAll()
